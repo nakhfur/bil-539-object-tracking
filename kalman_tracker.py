@@ -1,0 +1,214 @@
+import os
+import glob
+import time
+import math
+import cv2
+import xml.etree.ElementTree as ET
+import numpy as np
+
+SHOW_GUI = True
+ROI_SCALE = 2.0
+CONFIDENCE_THRESH = 0.5
+
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+IMAGES_ROOT = os.path.join(PROJECT_ROOT, "images")
+ANNOS_ROOT  = os.path.join(PROJECT_ROOT, "annotations")
+SEQUENCE_NAME = "MVI_20011"
+IMAGES_DIR = os.path.join(IMAGES_ROOT, SEQUENCE_NAME)
+XML_PATH   = os.path.join(ANNOS_ROOT, SEQUENCE_NAME + ".xml")
+
+def load_frame_paths(images_dir):
+    paths = glob.glob(os.path.join(images_dir, "*.jpg"))
+    paths.sort()
+    return paths
+
+def load_annotations(xml_path, target_id=1):
+    tree = ET.parse(xml_path)
+    root = tree.getroot()
+    boxes = []
+    for frame in root.iter('frame'):
+        box_for_this_frame = None
+        target_list = frame.find('target_list')
+        if target_list is not None:
+            for target in target_list.iter('target'):
+                if int(target.attrib.get('id', -1)) == target_id:
+                    box = target.find('box')
+                    if box is not None:
+                        x = float(box.attrib['left'])
+                        y = float(box.attrib['top'])
+                        w = float(box.attrib['width'])
+                        h = float(box.attrib['height'])
+                        box_for_this_frame = (x, y, w, h)
+                    break
+        boxes.append(box_for_this_frame)
+    return boxes
+
+def box_iou(boxA, boxB):
+    if boxA is None or boxB is None: return 0.0
+    xA = max(boxA[0], boxB[0])
+    yA = max(boxA[1], boxB[1])
+    xB = min(boxA[0] + boxA[2], boxB[0] + boxB[2])
+    yB = min(boxA[1] + boxA[3], boxB[1] + boxB[3])
+    interW = max(0, xB - xA)
+    interH = max(0, yB - yA)
+    interArea = interW * interH
+    if interArea == 0: return 0.0
+    areaA = boxA[2] * boxA[3]
+    areaB = boxB[2] * boxB[3]
+    return interArea / float(areaA + areaB - interArea)
+
+def box_center(box):
+    if box is None: return None
+    x, y, w, h = box
+    return x + w / 2.0, y + h / 2.0
+
+def center_location_error(box_pred, box_gt):
+    if box_pred is None or box_gt is None: return None
+    cx_p, cy_p = box_center(box_pred)
+    cx_g, cy_g = box_center(box_gt)
+    return math.sqrt((cx_p - cx_g) ** 2 + (cy_p - cy_g) ** 2)
+
+def init_kalman_filter(init_x, init_y):
+    kf = cv2.KalmanFilter(4, 2)
+    
+    kf.transitionMatrix = np.array([
+        [1, 0, 1, 0],
+        [0, 1, 0, 1],
+        [0, 0, 1, 0],
+        [0, 0, 0, 1]
+    ], np.float32)
+    
+    kf.measurementMatrix = np.array([
+        [1, 0, 0, 0],
+        [0, 1, 0, 0]
+    ], np.float32)
+    
+    kf.processNoiseCov = np.eye(4, dtype=np.float32) * 0.03
+    kf.measurementNoiseCov = np.eye(2, dtype=np.float32) * 0.5
+    
+    kf.statePost = np.array([[init_x], [init_y], [0], [0]], np.float32)
+    kf.errorCovPost = np.eye(4, dtype=np.float32)
+    
+    return kf
+
+if __name__ == "__main__":
+    print("Loading data...")
+    frame_paths = load_frame_paths(IMAGES_DIR)
+    gt_boxes = load_annotations(XML_PATH, target_id=35)
+
+    if not frame_paths:
+        print(f"ERROR: Images not found! Check path {IMAGES_DIR}")
+        exit()
+
+    start_idx = 0
+    for i, b in enumerate(gt_boxes):
+        if b is not None:
+            start_idx = i
+            break
+    
+    print(f"Tracking starting from frame {start_idx}.")
+
+    first_frame = cv2.imread(frame_paths[start_idx])
+    fx, fy, fw, fh = map(int, gt_boxes[start_idx])
+    template = first_frame[fy:fy+fh, fx:fx+fw]
+    template_gray = cv2.cvtColor(template, cv2.COLOR_BGR2GRAY)
+    th, tw = template_gray.shape
+
+    init_cx = fx + fw / 2.0
+    init_cy = fy + fh / 2.0
+    kf = init_kalman_filter(init_cx, init_cy)
+
+    iou_list = []
+    cle_list = []
+    
+    t0 = time.time()
+
+    for idx in range(start_idx, len(frame_paths)):
+        frame = cv2.imread(frame_paths[idx])
+        if frame is None: break
+        
+        frame_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        img_h, img_w = frame_gray.shape
+
+        prediction = kf.predict()
+        pred_cx, pred_cy = prediction[0][0], prediction[1][0]
+
+        roi_w = int(tw * ROI_SCALE)
+        roi_h = int(th * ROI_SCALE)
+        
+        roi_x = int(pred_cx - roi_w / 2)
+        roi_y = int(pred_cy - roi_h / 2)
+        
+        roi_x = max(0, min(roi_x, img_w - roi_w))
+        roi_y = max(0, min(roi_y, img_h - roi_h))
+        roi_w = min(roi_w, img_w - roi_x)
+        roi_h = min(roi_h, img_h - roi_y)
+        
+        roi_frame = frame_gray[roi_y:roi_y+roi_h, roi_x:roi_x+roi_w]
+
+        measured_cx, measured_cy = pred_cx, pred_cy
+        is_occluded = False
+        max_val = 0.0
+
+        if roi_frame.shape[0] >= th and roi_frame.shape[1] >= tw:
+            res = cv2.matchTemplate(roi_frame, template_gray, cv2.TM_CCOEFF_NORMED)
+            _, max_val, _, max_loc = cv2.minMaxLoc(res)
+            
+            local_x, local_y = max_loc
+            measured_cx = roi_x + local_x + tw / 2.0
+            measured_cy = roi_y + local_y + th / 2.0
+            
+            if max_val >= CONFIDENCE_THRESH:
+                measurement = np.array([[np.float32(measured_cx)], [np.float32(measured_cy)]])
+                kf.correct(measurement)
+            else:
+                is_occluded = True
+        else:
+            is_occluded = True
+
+        final_cx = kf.statePost[0][0]
+        final_cy = kf.statePost[1][0]
+
+        pred_x = int(final_cx - tw / 2)
+        pred_y = int(final_cy - th / 2)
+        pred_box = (pred_x, pred_y, tw, th)
+
+        gt_box = gt_boxes[idx]
+        if gt_box:
+            iou = box_iou(pred_box, gt_box)
+            cle = center_location_error(pred_box, gt_box)
+            iou_list.append(iou)
+            cle_list.append(cle)
+
+        if SHOW_GUI:
+            cv2.rectangle(frame, (roi_x, roi_y), (roi_x+roi_w, roi_y+roi_h), (255, 200, 0), 1)
+            
+            color = (0, 0, 255) if is_occluded else (0, 255, 0)
+            cv2.rectangle(frame, (pred_x, pred_y), (pred_x+tw, pred_y+th), color, 2)
+            
+            if gt_box:
+                gx, gy, gw, gh = map(int, gt_box)
+                cv2.rectangle(frame, (gx, gy), (gx+gw, gy+gh), (255, 255, 255), 1)
+
+            info_text = f"Frame: {idx} | Score: {max_val:.2f}"
+            if is_occluded: info_text += " [OCCLUDED]"
+            cv2.putText(frame, info_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+            
+            cv2.imshow("Kalman Tracker", frame)
+            if cv2.waitKey(1) == 27:
+                break
+
+    total_time = time.time() - t0
+    num_frames = len(iou_list)
+    fps = num_frames / total_time if total_time > 0 else 0
+
+    print("\n" + "="*30)
+    print("      EXPERIMENTAL RESULTS      ")
+    print("="*30)
+    print(f"Total Frames : {num_frames}")
+    print(f"Average IoU  : {np.mean(iou_list):.4f}")
+    print(f"Average CLE  : {np.mean(cle_list):.2f} px")
+    print(f"Speed (FPS)  : {fps:.2f}")
+    print("="*30)
+
+    cv2.destroyAllWindows()
